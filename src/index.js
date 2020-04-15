@@ -1,6 +1,6 @@
 'use strict';
 
-const { ApolloLink, Observable } = require('apollo-link');
+const { ApolloLink, Observable, fromError } = require('apollo-link');
 const {
   selectURI,
   selectHttpOptionsAndBody,
@@ -180,6 +180,7 @@ exports.createUploadLink = ({
   credentials,
   headers,
   includeExtensions,
+  useGETForQueries,
 } = {}) => {
   const linkConfig = {
     http: { includeExtensions },
@@ -189,7 +190,7 @@ exports.createUploadLink = ({
   };
 
   return new ApolloLink((operation) => {
-    const uri = selectURI(operation, fetchUri);
+    let uri = selectURI(operation, fetchUri);
     const context = operation.getContext();
 
     // Apollo Graph Manager client awareness:
@@ -249,7 +250,24 @@ exports.createUploadLink = ({
       });
 
       options.body = form;
-    } else options.body = payload;
+    } else {
+      // If requested, set method to GET if there are no mutations.
+      if (
+        useGETForQueries &&
+        !operation.query.definitions.some(
+          (definition) =>
+            definition.kind === 'OperationDefinition' &&
+            definition.operation === 'mutation'
+        )
+      )
+        options.method = 'GET';
+
+      if (options.method === 'GET') {
+        const { newURI, parseError } = rewriteURIForGET(uri, body);
+        if (parseError) return fromError(parseError);
+        uri = newURI;
+      } else options.body = payload;
+    }
 
     return new Observable((observer) => {
       // If no abort controller signal was provided in fetch options, and the
@@ -298,3 +316,72 @@ exports.createUploadLink = ({
     });
   });
 };
+
+/**
+ * Converts a given GraphQL POST request URI and body into a GET request URI
+ * with query string parameters. The given URI must be well-formed and can’t
+ * contain conflicting query parameters. The standard URL API is avoided as
+ * browser support is not universal.
+ * @kind function
+ * @name rewriteURIForGET
+ * @see [`apollo-link-http` implementation](https://github.com/apollographql/apollo-link/blob/c6f0cf7f3a02bf34587c9660387ca8a4b16d4bb8/packages/apollo-link-http/src/httpLink.ts#L198).
+ * @param {string} chosenURI POST request URI.
+ * @param {object} body POST request body.
+ * @returns {{newURI: string}|{parseError: object}} GET request URI, or a parse error.
+ * @ignore
+ */
+function rewriteURIForGET(chosenURI, body) {
+  const queryParams = [];
+  const addQueryParam = (key, value) => {
+    queryParams.push(`${key}=${encodeURIComponent(value)}`);
+  };
+
+  if ('query' in body) addQueryParam('query', body.query);
+
+  if (body.operationName) addQueryParam('operationName', body.operationName);
+
+  if (body.variables) {
+    let serializedVariables;
+
+    try {
+      serializedVariables = serializeFetchParameter(
+        body.variables,
+        'Variables map'
+      );
+    } catch (parseError) {
+      return { parseError };
+    }
+
+    addQueryParam('variables', serializedVariables);
+  }
+
+  if (body.extensions) {
+    let serializedExtensions;
+
+    try {
+      serializedExtensions = serializeFetchParameter(
+        body.extensions,
+        'Extensions map'
+      );
+    } catch (parseError) {
+      return { parseError };
+    }
+
+    addQueryParam('extensions', serializedExtensions);
+  }
+
+  let fragment = '';
+  let preFragment = chosenURI;
+
+  const fragmentStart = chosenURI.indexOf('#');
+  if (fragmentStart !== -1) {
+    fragment = chosenURI.substr(fragmentStart);
+    preFragment = chosenURI.substr(0, fragmentStart);
+  }
+
+  const queryParamsPrefix = preFragment.indexOf('?') === -1 ? '?' : '&';
+
+  return {
+    newURI: preFragment + queryParamsPrefix + queryParams.join('&') + fragment,
+  };
+}
